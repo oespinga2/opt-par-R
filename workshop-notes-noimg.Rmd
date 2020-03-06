@@ -1,0 +1,992 @@
+---
+title: "R Workshop Notebook - Optimization and Parallel Computating in R"
+author:
+- Osvaldo Espin-Garcia
+output:
+  html_document:
+    highlight: haddock
+    self_contained: true
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+---
+
+**Date Created:** 2020-02-28
+
+**Date Updated:** `r Sys.Date()`
+
+```{r setup, echo=FALSE, results='none', message = FALSE, warning = FALSE}
+knitr::opts_chunk$set(message = FALSE,
+                      warning = FALSE)
+options(knitr.kable.NA = '')
+### Here, I'm using packman package to load packages if not currently available 
+require(pacman)
+p_load(rbenchmark, rmarkdown, knitr, gtools, optimx, pracma, adagio, ucminf, nloptr, dfoptim, lbfgs, alabama, CVXR, GA, parallel, foreach, iterators, doParallel, snow, doSNOW)
+```
+
+# Getting started
+
+This document contains the material for this workshop, the code needed to execute it, and the results. These materials have been prepared as an R Markdown (.Rmd) file. It has been rendered as HTML for portability, however, you can render the file to a PDF (using LaTeX) or even as a Word document by changing a few lines in the preamble of the .Rmd file.
+
+## Packages needed
+
+Overall:
+
+```{r inst0, eval=FALSE}
+install.packages(c('rbenchmark', 'rmarkdown', 'knitr', 'gtools'))
+```
+
+
+For the optimization part, we will be using the following packages:
+
+```{r inst1, eval=FALSE}
+install.packages(c('optimx', 'pracma', 'ucminf', 'adagio', 'nloptr', 'dfoptim', 'lbfgs', 'alabama', 'CVXR', 'GA'))
+```
+
+For the parallel computating part, we will be using the following packages:
+
+```{r inst2, eval=FALSE}
+install.packages(c('parallel', 'foreach', 'iterators', 'doParallel', 'snow', 'doSNOW'))
+```
+
+
+# Optimization in R
+
+Diclosure: Most of this section is based on an R User Group Meeting talk by Hans W Borchers in Cologne, Germany on September 2017 ([original slides](https://hwborchers.lima-city.de/Presents/ROptimSlides4.pdf)).
+
+Current (March, 2020) optimization packages: 132 ([R task view](https://cran.r-project.org/view=Optimization)).
+
+Topics to cover:
+
+  - a 'simple' example: logistic regression
+  - unconstrained optimization: `optim()` and beyond
+  - constrained optimization
+  - stochastich optimization (genetic algorithms)
+ 
+
+## What is optimization and why do we need it?
+
+- Loosely speaking, optimization is the mathematical/computational procedure to find maxima or minima of a function.
+
+- Some typical uses include:
+    - Maximum Likelihood
+    - Penalized estimation, e.g. LASSO
+    - Nonlinear equations
+    - Deep Learning / Support Vector Machines
+    - Operations Research, e.g. network flow, resource allocation
+
+
+## Issues commonly found
+
+- optimization can be computationally expensive
+
+- usually no "one size fits all" exists $\rightarrow$ different objective functions and domains
+
+- very high accuracy is usually needed
+
+- global optimum is typically pursued (but local optima are often present)
+
+
+
+## A 'simple' example
+
+We are all familiar with logistic regression, so, let's start there. 
+
+Recall the (log)-likelihood for a logistic regression model is expressed as:
+
+$$
+l(\beta) = \sum_{i=1}^{n} y_i\log[\phi(x_i^t\beta)] + (1-y_i)\log[1-\phi(x_i^t\beta)]
+$$
+where $y_i\in \{0,1\}$ is a binary outcome, e.g. case/control status and $x_i=(1,\ldots,x_{ip-1})$ is a set of $p$ covariates for $i=1,\ldots,n$ observations. Further, $\phi(\cdot)$ is the logistic function, i.e. $\phi(z)=\frac{1}{1+e^{-z}}$.
+
+The above is a function of $\beta=(\beta_0,\ldots,\beta_{p-1})$, the regression parameters, for which we need to find the values that maximize the above expression given $(y,x)$.
+
+Most of you would simply use R function `glm()` to solve this, no questions asked, why? what is `glm()` doing under the hood? can we do better? what kind of problems `glm()` cannot solve for us?
+
+
+### Implementing logistic regression from scratch
+
+We can compute the log-likelihood for this problem in a few ways:
+
+```{r log}
+llreg1 <- function(beta,y,x){
+  ll <- 0
+  for(i in 1:length(y)){
+    mui <- gtools::inv.logit(sum(x[i,]*beta))
+    ll <- ll + y[i]*log(mui) + (1-y[i])*log(1-mui)
+  }
+  return(-ll)
+}
+
+llreg2 <- function(beta,y,x){
+    mu <- gtools::inv.logit(x%*%beta)
+    ll <- sum( y*log(mu) + (1-y)*log(1-mu))
+    return(-ll)
+}
+  
+llreg3 <- function(beta,y,x){
+  mu <- gtools::inv.logit(x%*%beta)
+  ll <- sum(dbinom(y,size=1,prob=mu,log=TRUE))
+  return(-ll)
+}
+
+# Simulate some data to check whether the three functions give the same results
+set.seed(1239)
+n <- 100
+Beta <- c(1, 0.5, -0.3) # true values
+x <- cbind(x0=1,x1=rnorm(n),x2=rbinom(n,size=1,prob=0.4))
+mu <- as.numeric(gtools::inv.logit(x%*%Beta))
+y <- rbinom(n,1,prob=mu)
+
+# Check functions at beta=c(0,0,0)
+beta=c(0,0,0)
+a=llreg1(beta,y,x)
+b=llreg2(beta,y,x)
+c=llreg3(beta,y,x)
+
+all.equal(a,b)
+all.equal(b,c)
+all.equal(a,c)
+```
+
+Ok, the three functions give the same results back, which one should we pick? why? 
+
+### Objective function performance
+
+As mentioned above, we can implement the objective function in multiple, ways. We should bear in mind that the better the performance of the objective function the faster and more reliable the optimization will be. For this purpose, we can benchmark the function implementations effortessly as follows:
+
+```{r,cache=TRUE, results='asis'}
+set.seed(1239)
+
+tab <- data.frame()
+for( n in c(1000,5000) ){ 
+  xn <- cbind(x0=1,x1=rnorm(n),x2=rbinom(n,size=1,prob=0.4))
+  mun <- as.numeric(gtools::inv.logit(xn%*%Beta))
+  yn <- rbinom(n,1,prob=mun)
+
+
+  tab0 <- benchmark(replications=c(500),
+            llreg1=llreg1(beta,yn,xn),
+            llreg2=llreg2(beta,yn,xn),
+            llreg3=llreg3(beta,yn,xn),
+            columns=c('test', 'replications', 'elapsed'))
+  
+  tab <- rbind(tab,data.frame(n=c(n,NA,NA),tab0))
+}
+
+kable(tab, row.names=FALSE)
+
+```
+
+The perfomance results can of course vary if we change the simulation values (`Beta`,`beta`,`n`). However, it's clear that `llreg1()` has a really poor performance. 
+
+
+### Iterative Re-Weighted Least Squares (IRWLS)
+
+As you may know, the usual way to find the maximum likelihood estimates for logistic regression (and glm's in general) is through IRWLS. 
+
+IRWLS is in essence an implementation of the famous Newton-Raphson method, an iterative algorithm to find zeros in functions:
+
+$$
+\beta^{k+1}= \beta^{k}- H^{-1}(\beta^{k})l'(\beta^{k}),
+$$
+where $l'(\beta^{k})$ is the gradient (vector of first derivatives) of $l(\beta)$ whereas $H$ is the Hessian matrix of $l(\beta)$, which contains all second order partial derivatives. In the case of logistic regression, the first and second derivatives are relatively easy to find, thus, IRWLS can be implemented without much hassle.
+
+However, there are other functions for which finding first and second order derivatives can be more problematic.
+
+
+## Unconstrained optimization
+
+### A naive call to `optim()`
+
+The R function `optim()` has been R's workhorse for general (unconstrained and box-constrained) optimization problems.
+```{r}
+# MLE solution using the data above
+(mle <- glm.fit(x,y,family = binomial())$coef)
+
+
+# naive call to optim
+(r1 = optim(par=beta, fn=llreg2, y=y, x=x))
+
+# difference
+all.equal(mle, r1$par, check.attributes = FALSE)
+
+```
+So, although the results are close to each other, these aren't exaclty the same, why?
+
+### Improving performance in `optim()` 
+
+Part of the issue with the naive call to `optim()` is that the default method -Nelder-Mead-, although robust in multiple situations, tends to be relatively slow and all it only uses the fuction values. Let's try the function under the widely used Broyden-Fletcher-Goldfarb-Shanno (BFGS) algorithm:
+```{r}
+r2 = optim(par=beta, fn=llreg2, y=y, x=x, method="BFGS")$par
+
+# difference
+all.equal(mle, r2, check.attributes = FALSE)
+```
+This was much better by only providing the function to optimize, I'd say. But, can we do better?
+
+
+### Improving performance in `optim()` (cont'd)
+
+Turns out we can do slightly better by using a calculated gradient. In fact, the `BFGS` algorithm requires gradient values for its implementation. Since we left option `gr` unspecified, a finite-difference appoximation for the gradient is used instead. Let's try specifying the function directly.
+
+```{r}
+# gradient function, same parameters as llreg[1-3]
+llgr <- function(beta,y,x){
+  mu <- gtools::inv.logit(x%*%beta)
+  return(-as.numeric(crossprod(x,(y-mu))))
+}
+
+r3 = optim(par=beta, fn=llreg2, gr=llgr, y=y, x=x, method="BFGS")$par
+
+# difference
+all.equal(mle,r3,check.attributes = FALSE)
+```
+Slight improvement in this case, not too bad.
+
+
+### Best practices for `optim()`
+
+The settings below are recommended for the usage of `optim()` function:
+
+```{r}
+r4 = optim(par=beta, fn=llreg2, gr=llgr, y=y, x=x,
+           method="L-BFGS-B", 
+           control = list(factr = 1e-10, maxit = 50*length(par)))$par
+
+# difference
+all.equal(mle,r4,check.attributes = FALSE)
+```
+Note that for cases when no analytical gradient is available, it is preferable to compute  numerical gradients using packages `dfoptim`, `numDeriv`, `pracma` or similar, e.g. `gr = function(x) pracma::grad(fn, x)`.
+
+Of course, in this case, we know the "ground truth" provided by `glm.fit()`. In real applications we don't have that luxury. 
+
+
+### Beyond `optim()`
+
+Three routines implemented in `optim()`: Nelder-Mead, BFGS, and CG, were first developed by Professor John C. Nash from University of Ottawa in the 1970's and later ported into C by Bryan Ripley (R Core member). These routines were implemented in an era where most computers had low memory ($\approx$ 8kb), since then, better tools have been de developed, however.
+
+Function `opm()` in package `optimx` provides a wrapper for a variey of solvers and routines, note that in some cases the hessian of the function is also needed (Newton-methods).
+
+```{r, cache=TRUE, results='hide'}
+
+llreg2_ <- function(beta){
+  llreg2(beta,y,x)
+}
+llgr_ <- function(beta){
+  llgr(beta,y,x)
+}
+llhes_ <- function(beta){
+  mu <- gtools::inv.logit(x%*%beta)
+  w <- as.numeric(sqrt(mu*(1-mu)))
+  return(crossprod(x*w,x*w))
+}
+ans = opm(par=beta, fn=llreg2_, gr=llgr_, hess = llhes_, method = "ALL", control=list(trace=0))
+```
+
+```{r,echo=FALSE}
+ans$mean.dif <- apply(ans[,1:3],1,function(x){
+  mean(x-mle)
+})
+ans1 <- data.frame(ans)
+ans1$mean.dif <- format(ans1$mean.dif,digits = 2,scientific = TRUE)
+```
+
+
+```{r, results='asis',echo=FALSE}
+kable(ans1[,-c(1:3,8:9)], align='r', digits=c(3,0,0,0,3,2), row.names=TRUE)
+```
+
+## Constrained optimization
+
+
+### Box constraints
+In principle, `optim()` and similar solvers can handle box (or bounds) constraints. This is, they allow the algorithm search to be performed in a specific parameter domain. See `lower` and `upper` options.
+
+What if the solver does not support bound contraints? $\rightarrow$ transfinite trick
+
+Suppose we want to solve an optimization problem for $\theta=(\theta_1,\ldots,\theta_p)$ such that $l_i \leq \theta_i \leq u_i$, $i=1,\ldots,p$. 
+
+The transfinite trick consists of the following:
+Define a function $h: R^p \rightarrow [l_i, u_i]$, e.g.
+$$ h: \theta_i \rightarrow l_i + \frac{u_i - l_i }{2}  [1 + \tanh(\theta_i)], $$
+then optimize the composite function $g(\theta) = f(h(\theta))$, i.e. $g : R^p \rightarrow [l_i , u_i ] \rightarrow R$
+$$
+\theta^* = \min  g(\theta) = f(h(\theta))
+$$
+then $\theta^\dagger = h(\theta^*)$ will be a minimum of $f$ in $[l_i, u_i]$.
+
+### Transfinite trick example
+
+Let's minimize the logistic function with parameter domain in $[0,0.5]$
+```{r}
+Tf <- adagio::transfinite(0, 0.5, 3)
+h <- Tf$h
+hinv <- Tf$hinv
+f <- function(beta) llreg2_(hinv(beta)) # f: R^p --> R
+g <- function(beta) pracma::grad(f, beta)
+soltf <- lbfgs::lbfgs(f, g, beta, epsilon=1e-10, invisible=1)
+round(hinv(soltf$par),3)
+soltf$value
+```
+
+
+### More general constraints
+
+In general, we are interested in solving problems of this form:
+$$
+\min f(\beta) \ \ \hbox{s.t.} \ g(\beta) \geq 0, h(\beta)=0.
+$$
+Multitude of packages can tackle this problem e.g. `dfoptim`, `alabama`, `nloptr`, `Rsolp`. Some are derivative-free, some use augmented Lagrangian approaches.
+
+There are a few useful tricks in implementing some of these solvers:
+
+
+- For linear equality constraints, i.e. $A\beta=c$, we can find a solution by minimizing a new function $g(\xi)=f(\beta^*+ B_0^t\xi)$ without constraints, where $\beta^*$ is a special solution of $A\beta= c$ and $B_0$ is a basis of the *null space* of $A$.
+
+- Equality constraints can be implemented if unavailable by specifing two sets of inequality constraints, i.e. $g(\beta) \geq 0$ and $g(\beta) \leq 0$.
+
+A slighltly more advanced example (logistic regression with solution subject to a sum constraint of positive parameters):
+$$
+\max ll(\beta) \ \ \hbox{s.t.} \ \sum_{j=0}^{p-1} \beta_j =1, \beta_j>=0.
+$$
+
+#### *Null space* trick (note that the box constraint is not enforced)
+```{r}
+A <- matrix(1, 1, length(beta)) # \sum \beta_j = 1
+N <- pracma::nullspace(A) 
+beta0 <- qr.solve(A, 1) # A beta = 1
+fun <- function(s) llreg2_(beta0 + N %*% s) 
+sol0 <- ucminf::ucminf(c(0,0), fun)
+xmin <- c(beta0 + N %*% sol0$par)
+round(xmin,3)
+sum(xmin)
+sol0$value
+```
+
+#### Augmented Lagrangian
+```{r}
+fheq <- function(beta) sum(beta) - 1
+fhin <- function(beta) c(beta)
+sol1 <- alabama::auglag(beta, fn=llreg2_, gr=llgr_, heq = fheq, hin = fhin, control.outer = list(trace = FALSE, method = "nlminb"))
+round(sol1$par, 3)
+sum(sol1$par)
+sol1$value
+```
+
+#### Derivative-free
+```{r}
+fhin2 <- function(beta){
+  ui <- rbind(-rep(1,length(beta)),rep(1,length(beta)))
+  ci <- c(-1,1)
+  return(as.numeric(ui%*%beta-ci))
+} 
+sol2 <- cobyla(beta, fn=llreg2_, lower=rep(0,length(beta)), hin = fhin2)
+round(sol2$par, 3)
+sum(sol2$par)
+sol2$value
+```
+
+
+
+### `CVXR`: An R Package for Disciplined Convex Optimization
+
+`CVXR` is a package that provides a very flexible modeling language for convex optimization problems.
+
+We can recreate logistic regression under the `CVXR` framework:
+```{r}
+p <- length(beta)
+betaHat <- Variable(p)
+obj <- -sum(x[y <= 0, ] %*% betaHat) - sum(logistic(-x %*% betaHat))
+problem <- Problem(Maximize(obj))
+result <- solve(problem)
+
+beta_res <- as.numeric(result$getValue(betaHat))
+
+all.equal(beta_res, mle, check.attributes = FALSE)
+
+result$value
+cat("Solution status is", result$status)
+```
+
+Not very exciting, however, we can add constraints very easily.
+```{r}
+problem1 <- Problem(Maximize(obj), constraints = list(betaHat >= 0))
+result1 <- solve(problem1)
+
+beta_res1 <- as.numeric(result1$getValue(betaHat))
+
+round(beta_res1,3)
+result1$value
+cat("Solution status is", result1$status)
+```
+
+An example from before.
+```{r}
+constraint1 <- betaHat <= 0.5
+constraint2 <- betaHat >= 0
+problem2 <- Problem(Maximize(obj), constraints = list(constraint1, constraint2))
+result2 <- solve(problem2)
+
+beta_res2 <- as.numeric(result2$getValue(betaHat))
+
+round(beta_res2,3)
+result2$value
+cat("Solution status is", result2$status)
+```
+
+And another one.
+```{r}
+constraint3 <- list(sum(betaHat) == 1, betaHat>=0)
+problem3 <- Problem(Maximize(obj), constraint3)
+result3 <- solve(problem3)
+
+beta_res3 <- as.numeric(result3$getValue(betaHat))
+
+round(beta_res3,3)
+sum(beta_res3)
+result3$value
+cat("Solution status is", result3$status)
+```
+
+## Stochastic optimization
+There are many stochastic optimization approaches: simulated annealing, differential evolution, stochastic gradient descent, genetic algorithms, etc. We are only focusing on genetic algorithms in this workshop. The main feature of this type of optimization lies in their non-deterministic nature.
+
+### Genetic algorithms (GAs)
+
+GAs perform optimization by mimicking nature's evolutionary processes. Further, GA's are typically designed to solve discrete optimization problems, although generalizations exists. Moreover, they tend to work well in large search space cases.
+
+The following diagram attempts to explain the general steps undergone in a GA.
+
+
+#### GA example
+Let's see a GA in action, again using logistic regression. This implementation loosely follows [this post](https://towardsdatascience.com/feature-selection-using-genetic-algorithms-in-r-3d9252f1aa66).
+```{r,eval=FALSE,echo=FALSE}
+nterms <- function(p){sum(sapply(1:p,function(r)choose(p,r)))}
+nterms(5)
+```
+
+```{r,cache=TRUE}
+# simulate data 
+set.seed(12397)
+n <- 1000
+BetaGA <- rep(0,31) 
+BetaGA[sample(2:31,10)] <- rnorm(10) # true values
+X <- cbind(x1=rnorm(n),x2=rbinom(n,size=1,prob=0.4),x3=runif(n),x4=rbinom(n,size=1,prob=0.7),x5=rnorm(n))
+X <- model.matrix( ~.^2 +.^3+.^4+.^5, data=data.frame(X))[,-1]
+mu <- as.numeric(gtools::inv.logit(X%*%BetaGA))
+Y <- rbinom(n,1,prob=mu)
+
+select <- sample(n,round(n*0.7))
+data_train <- data.frame(y=Y,X)[select,]
+data_test <- data.frame(y=Y,X)[-select,]
+
+col_names = names(data_train[,-1])
+  
+# fitness function
+fitnessfun <- function(vars){
+  fit <- glm(as.formula(paste0("y~",paste(vars,collapse="+"))), data = data_train, family = binomial())
+  pred <- predict(fit, data_test, type = "response")
+  return(-mean((data_test$y-pred)^2)) # ga() performs maximization
+} 
+
+# GA function call
+system.time({
+  ga_obj = ga(fitness = fitnessfun, # custom fitness function
+             type = "binary", # optimization data type
+             elitism = 150, # number of best ind. to pass to next iteration
+             pcrossover = 0.85, # crossover probability
+             pmutation = 0.05, # mutation rate prob
+             popSize = 200, # the number of individuals/solutions
+             nBits = ncol(X), # total number of variables
+             names = col_names, # variable name
+             run = 50, # max iter without improvement (stopping criteria)
+             maxiter = 100, # total runs or generations
+             monitor = FALSE, # plot the result at each iteration
+             keepBest = TRUE, # keep the best solution at the end
+             parallel = FALSE, # allow parallel procesing (more on this later)
+             seed = 84211 # for reproducibility purpose
+)
+})
+
+x <- system.time(fitnessfun(col_names))
+
+# time it would take calculate the entire search space
+x["elapsed"]*(2^31)
+
+summary(ga_obj)
+
+# best vars 
+bestvars <- col_names[which(BetaGA!=0)]
+fitnessfun(bestvars)
+length(bestvars)
+
+# GA vars
+best_vars_ga = col_names[ga_obj@solution[1,]==1]
+fitnessfun(best_vars_ga)
+length(best_vars_ga)
+
+# % common vars b/t GA and best solution
+100*sum(bestvars%in%best_vars_ga)/length(bestvars)
+```
+Issues with GAs
+
+- No clear convergence criteria
+- No guarantee of reaching a global optimum $\rightarrow$ approx. solutions
+- Application-specific, algorithm parameters need to be tuned appropriately
+
+
+
+# Parallel computing in R
+
+Current (March, 2020) high-performance and parallel computing packages: 95 [R task view ](https://CRAN.R-project.org/view=HighPerformanceComputing).
+
+
+Topics to cover:
+
+  - overview and some definitions
+  - out-of-the-box implementations
+  - `foreach` package
+  - `iterators` package
+
+## Overview
+
+Most recent computers come equipped with a fair ammount of processing power, e. g. recent Intel Core i9 chips come with 8 cores. We can easily know how many cores our computer has with the following command:
+
+```{r}
+parallel::detectCores()
+```
+
+Given how inexpensive computation has become in the recent times, more and more institutions have access to the so-called 'super' or high-performance computers (HPC). Moreover, AWS, Google Cloud, and Microsoft Azure, among others also provide HPC services.
+
+Scientific computing has benefited greatly from these advances and many routines and algorithms have incorporated parallelism, e.g. the well known LAPACK library using OpenMP. Although understanding these implementations are beyond the scope of this workshop, it is important to know when/where/if any of these routines are being used within a given R package. In fact, many of these have been already incorporated into R, e.g. Rmpi, which take advantage of standards for portable and scalable large-scale parallel applications.
+
+Today, we'll mainly focus on [embarrasingly parallel](https://en.wikipedia.org/wiki/Embarrassingly_parallel) problems, which are rather common in statistics, e.g. Monte Carlo simulations, bootstrap, cross validation, etc.
+
+### Shared vs. distributed memory
+
+## Out-of-the-box implementations
+Since R version 2.14.0, the package `parallel` is part of the base distribution and is supported by the R core development team.
+
+Package `parallel` comes with parallel implementations of the widely used family of *apply functions, e.g. apply, lapply, sapply.
+
+For example, try running the following code:
+```{r, error=TRUE}
+# calculate the number of cores
+no_cores <- parallel::detectCores() - 1
+ 
+# initiate cluster
+cl <- makeCluster(no_cores)
+
+n <- 10
+sd <- 2
+
+parLapply(cl, 2:4, function(mean)rnorm(n,mean,sd))
+
+# stop cluster
+stopCluster(cl)
+```
+
+What went wrong?
+
+Hopefully, the error is somewhat informative. Turns out that not all the cores are aware of object $n$ (nor $sd$ for that matter). Thus, we need to pass this information to all the cores. This is achieved as follows:
+```{r}
+n <- 10
+sd <- 2
+
+# initiate cluster
+cl <- parallel::makeCluster(no_cores)
+parallel::clusterExport(cl, c("n","sd"))
+
+parLapply(cl, 2:4, function(mean)rnorm(n,mean,sd))
+
+# stop cluster
+stopCluster(cl)
+```
+We could time the improvement with respect to the sequential alternative:
+```{r}
+system.time({
+  n <- 10
+  sd <- 2
+
+  # initiate cluster
+  cl <- parallel::makeCluster(no_cores)
+  parallel::clusterExport(cl, c("n","sd"))
+  
+  parLapply(cl, 2:4, function(mean)rnorm(n,mean,sd))
+  
+  # stop cluster
+  stopCluster(cl)
+})
+
+system.time({
+  lapply(2:4,function(mean)rnorm(n,mean,sd))
+})
+```
+Wait a moment, I though that parallel computation would be faster, wouldn't it? Short answer is, as usual, it depends!
+
+By using multiple cores, there is some overhead by initializing the cores and the communication among them. Thus, the performance increase is highly dependent on the type of application. Typically, fast computations with efficient use of processing power won't benefit as much as more time-consuming applications.
+
+The code below might be a bit better to parallelize:
+```{r, cache=TRUE}
+system.time({
+  n <- 1e8
+  sd <- 2
+  
+  # initiate cluster
+  cl <- parallel::makeCluster(no_cores)
+  parallel::clusterExport(cl, c("n","sd"))
+
+  parLapply(cl, 2:4, function(mean)summary(rnorm(n,mean,sd)))
+  
+  # stop cluster
+  stopCluster(cl)
+})
+
+system.time({
+  lapply(2:4,function(mean)summary(rnorm(n,mean,sd)))
+})
+```
+
+In addition of `clusterExport`, `parallel` has additional function to initialize variables, functions or packages in remote clusters, see the help page of `?clusterExport` for more details.
+
+### Random number generation
+In many instances, we are interested in making our rsults reproducible, which is usually achieved in the sequential setting by setting up a *seed*.
+
+As expected, running the same code involving random number generations twice gives us different results
+```{r}
+n <- 1000
+sd <- 2
+no_cores <- parallel::detectCores() - 1
+
+cl <- parallel::makeCluster(no_cores)
+clusterExport(cl,c("n","sd"))
+
+res1 <- parLapplyLB(cl,2:4,function(mean)rnorm(n,mean,sd))
+
+res2 <- parLapplyLB(cl,2:4,function(mean)rnorm(n,mean,sd))
+
+all.equal(res1,res2)
+```
+
+What if we naively use the function `set.seed`? 
+```{r}
+set.seed(17243)
+res1 <- parLapplyLB(cl,2:4,function(mean){
+  rnorm(n,mean,sd)})
+
+set.seed(17243)
+res2 <- parLapplyLB(cl,2:4,function(mean){
+  rnorm(n,mean,sd)})
+
+all.equal(res1,res2)
+```
+Does not seem to be of much help.
+
+Let's try something else that one may find intuitive.
+```{r}
+res1 <- parLapplyLB(cl,2:4,function(mean){
+  set.seed(17243)
+  rnorm(n,mean,sd)})
+
+res2 <- parLapplyLB(cl,2:4,function(mean){
+  set.seed(17243)
+  rnorm(n,mean,sd)})
+
+all.equal(res1,res2)
+```
+Well, this seems to work just fine, but, does it really? 
+
+A slighly different application using the "intuitive" use of `set.seed`.
+```{r}
+res1 <- parLapplyLB(cl,rep(100,3),function(n){
+  set.seed(17243)
+  rnorm(n,1,sd)})
+
+res2 <- parLapplyLB(cl,rep(100,3),function(n){
+  set.seed(17243)
+  rnorm(n,1,sd)})
+
+all.equal(res1,res2) # works fine?
+
+# A more careful check...
+all.equal(res1[[1]],res1[[2]])
+all.equal(res1[[2]],res1[[3]])
+all.equal(res2[[2]],res1[[3]])
+```
+All the replicates are the same!
+
+In fact, there is a specific way to set seeds in the parallel setting:
+```{r}
+clusterSetRNGStream(cl, rep(403,6) )
+res1 <- parLapplyLB(cl,rep(100,3),function(n){
+  rnorm(n,1,sd)})
+
+clusterSetRNGStream(cl, rep(403,6) )
+res2 <- parLapplyLB(cl,rep(100,3),function(n){
+  rnorm(n,1,sd)})
+
+all.equal(res1,res2)
+
+all.equal(res1[[1]],res1[[2]])
+all.equal(res1[[2]],res1[[3]])
+
+all.equal(res2[[2]],res1[[2]])
+all.equal(res2[[2]],res1[[3]])
+
+stopCluster(cl)
+```
+Ok, now that works.
+
+One limitation of `parallel`, however, is that it was designed for usage in shared memory architectures, For distributed memory architectures, package `snow` provides a robust alternative.
+
+
+## `foreach`
+Because of all the housekeeping that needs to be done using `parallel`, it tends to be burdensome to keep track of all variables/packages/functions that need to be passed to remote cores. Luckily, package `foreach` greatly helps with this.
+
+Basic call for `foreach`
+```{r, eval=FALSE}
+cl <- parallel::makeCluster(no_cores)
+
+doParallel::registerDoParallel(cl)
+
+res <- foreach(..., # controls the "loop" 
+        .combine, # how the results are put together (usually equals c, rbind, cbind)
+        .inorder=TRUE,
+       .errorhandling=c('stop', 'remove', 'pass'),
+       .packages=NULL, 
+       .export=NULL, 
+       .noexport=NULL,
+       .verbose=FALSE) %dopar%{
+         
+        # ... do something for a given iteration of the "loop"... #
+         
+         }
+
+stopCluster(cl)
+```
+Appeal of `foreach`
+- loop-like interfase 
+- seamless passing of needed variables, dataframes, functions (need to explictly define packages, however)
+- flexibility in the way results are combined
+
+### An example (logistic regression, anyone?)
+
+Let's see if we can improve the performance of a simple cross-validation checking.
+```{r}
+# number of folds
+cvfolds <- 5
+
+data.cv <- data.frame(y=Y,X[,gsub("[.]",":",bestvars)]) # from the GA example above
+reg_formula <- as.formula(paste0("y~",paste(bestvars, collapse="+")))
+# divide data in equally-sized folds (at random)
+set.seed(28197)
+data.cv$fold <- cut(sample(nrow(data.cv)),breaks=cvfolds,labels=FALSE)
+
+# standard looping strategy
+system.time({
+  res <- numeric(cvfolds)
+  for( foldi in 1:cvfolds){
+    fit <- glm(reg_formula,data.cv,subset = fold!=foldi,family=binomial())
+    pred <- predict(fit,data.cv[data.cv$fold==foldi,])
+    res[foldi] <- mean((data.cv$y[data.cv$fold==foldi]-pred)^2)
+  }
+})
+
+system.time({
+  cl <- makeCluster(no_cores)
+  registerDoSNOW(cl) # could also use registerDoParallel()
+  res.fe <- foreach(foldi=1:cvfolds, 
+                    .combine = c,
+                    .inorder=TRUE,
+                    .verbose=TRUE) %dopar% {
+    fit <- glm(reg_formula,data.cv[data.cv$fold!=foldi,], family=binomial())
+    pred <- predict(fit,data.cv[data.cv$fold==foldi,])
+    resi <- mean((data.cv$y[data.cv$fold==foldi]-pred)^2)
+    return(resi)
+  }
+  stopCluster(cl)
+})
+
+all.equal(res.fe,res)
+```
+
+### One practical recommendation
+Suppose you have a dataframe `data` that can be somehow indexed (or split) by variable `indx`, e.g. a replicate, a fold, a centre, etc. We could do the following:
+
+#### a not-so-great idea
+
+Can you say why?
+```{r, eval=FALSE}
+cl <- parallel::makeCluster(no_cores)
+
+doParallel::registerDoParallel(cl)
+
+res <- foreach(indxi = 1:nindx, .combine = rbind, 
+        .inorder=FALSE,
+       .errorhandling='remove',
+       .verbose=TRUE) %dopar%{
+         
+        datai = data[data$indx==indxi,]
+        
+        # ... do something with datai... #
+         
+       }
+stopCluster(cl)
+```
+
+#### a better idea
+
+Why?
+```{r, eval=FALSE}
+cl <- parallel::makeCluster(no_cores)
+
+doParallel::registerDoParallel(cl)
+
+res <- foreach(datai = isplit(data, list(indxi=data$indx)), .combine = rbind, 
+        .inorder=FALSE,
+       .errorhandling='remove',
+       .verbose=TRUE) %dopar%{
+         
+        # ... do something with datai... #
+         
+       }
+
+stopCluster(cl)
+```
+Above, we have taken advange of the function `isplit` in package `iterators`, which I'm going to introduce in more detail.
+
+## `iterators` 
+In most cases, it's better to pass only the portion of the data we are dealing with for a given iteration/core.
+
+### `icount`
+Performs a sequential count
+```{r}
+cl <- makeCluster(no_cores)
+registerDoSNOW(cl)
+clusterSetRNGStream(cl, rep(4039,6) )
+res <- foreach(iter = icount(10), .combine='rbind', .verbose=FALSE) %dopar% {
+    return(summary(rnorm(1000,mean=iter)))
+}
+stopCluster(cl)
+
+round(res,3)
+```
+Note that if this iterator is run without an argument, i.e. `icount()`, it will keep counting indefinitely. 
+
+### `iter`
+This function iterates over a variety of objects, more commonly matrices or dataframes. In particular, it allows to iterate over columns, rows or individual cells.
+```{r}
+iters.df <- expand.grid(mean=0:2,sd=3:5) 
+
+iters.df
+                        
+cl <- makeCluster(no_cores)
+registerDoSNOW(cl)
+clusterSetRNGStream(cl, rep(4039,6) )
+res <- foreach(iter = iter(iters.df, by='row'), .combine='rbind', .verbose=FALSE) %dopar% {
+    mean.iter = iter$mean
+    sd.iter = iter$sd
+    x = rnorm(1000, mean=mean.iter, sd=sd.iter)
+  return(c(summary(x),SD=sd(x)))
+}
+stopCluster(cl)
+
+round(res,3)
+```
+
+### `isplit`
+This iterator allows to divide a given vector or dataframe into groups according to a factor or list of factors.
+```{r}
+x <- rnorm(200)
+f <- factor(sample(1:10, length(x), replace=TRUE))
+
+head(cbind(x,f))
+
+cl <- makeCluster(no_cores)
+registerDoSNOW(cl)
+res <- foreach(iter = isplit(x, list(f=f)), .combine='rbind', .verbose=FALSE) %dopar% {
+  
+  factoriter <- iter$key$f
+  xiter <- iter$value
+
+  return(c(f=as.numeric(factoriter),summary(xiter),SD=sd(xiter)))    
+}
+stopCluster(cl)
+
+round(res,3)
+```
+
+## GA algorithm revisited
+
+Note that some packages have already incorporated paralellism within their implementation:
+
+```{r}
+# GA function call (change parallel option to TRUE)
+system.time({
+  ga_obj.par = ga(fitness = fitnessfun, # custom fitness function
+             type = "binary", # optimization data type
+             elitism = 150, # number of best ind. to pass to next iteration
+             pcrossover = 0.85, # crossover probability
+             pmutation = 0.05, # mutation rate prob
+             popSize = 200, # the number of individuals/solutions
+             nBits = ncol(X), # total number of variables
+             names = col_names, # variable name
+             run = 50, # max iter without improvement (stopping criteria)
+             maxiter = 100, # total runs or generations
+             monitor = FALSE, # plot the result at each iteration
+             keepBest = TRUE, # keep the best solution at the end
+             parallel = TRUE, # changed here
+             seed = 84211 # for reproducibility purpose
+)
+})
+
+summary(ga_obj.par)
+
+# best vars (from before)
+fitnessfun(bestvars)
+length(bestvars)
+
+# GA vars
+best_vars_ga.par = col_names[ga_obj.par@solution[1,]==1]
+fitnessfun(best_vars_ga.par)
+length(best_vars_ga.par)
+
+# % common vars b/t GA and best solution
+100*sum(bestvars%in%best_vars_ga.par)/length(bestvars)
+
+# same as before?
+all.equal(best_vars_ga.par, best_vars_ga)
+
+# the whole object is the same?
+all.equal(ga_obj.par, ga_obj)
+```
+
+
+
+# Take-home messages
+
+- *always* benchmark your code
+
+- squeeze as much performance as you can in your objective function/gradient (if possible/available)
+
+- know your solver! do research on best practices and useful tricks
+
+- take advantage of available computing power
+
+- be mindful of what you are passing to the cores, this can greatly impact performance
+
+
+# Resources
+
+- [Numerical Optimization in R: Beyond optim](https://www.jstatsoft.org/article/view/v060i01)
+- [On Best Practice Optimization Methods in R](https://www.jstatsoft.org/article/view/v060i02)
+- [`CVXR` vignette](https://cran.r-project.org/web/packages/CVXR/vignettes/cvxr_intro.html)
+- [`foreach` vignette](https://cran.r-project.org/web/packages/foreach/vignettes/foreach.html)
+- [Intro to parallel computing in R](https://nceas.github.io/oss-lessons/parallel-computing-in-r/parallel-computing-in-r.html)
+- [A guide to parallelism in R](https://privefl.github.io/blog/a-guide-to-parallelism-in-r/)
+- [Compute Canada](https://www.computecanada.ca/)
+- [SciNet](https://www.scinethpc.ca/)
+
+
