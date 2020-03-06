@@ -1,5 +1,5 @@
 ---
-title: "R Workshop Notebook - Optimization and Parallel Computating in R"
+title: "R Workshop Notebook - Optimization and Parallel Computing in R"
 author:
 - Osvaldo Espin-Garcia
 output:
